@@ -27,6 +27,22 @@ inputs:
     description: 'Glob pattern of artifacts to upload to GitHub release (e.g., "*.vsix" or "*.tgz")'
     required: false
     default: ''
+  generate-changelog:
+    description: 'Generate and commit CHANGELOG.md file to repository'
+    required: false
+    default: 'false'
+  changelog-file:
+    description: 'Path to the changelog file'
+    required: false
+    default: 'CHANGELOG.md'
+  changelog-template:
+    description: 'Changelog template type: "custom" (uses handlebars templates) or "compact" (uses release-it default)'
+    required: false
+    default: 'custom'
+  generate-release-notes:
+    description: 'Generate release notes for GitHub release'
+    required: false
+    default: 'true'
   publish-marketplace:
     description: 'Publish to VS Code Marketplace (requires vsce-pat)'
     required: false
@@ -158,36 +174,101 @@ runs:
 
     - name: Create Release-it Config
       shell: bash
+      env:
+        GENERATE_CHANGELOG: ${{ inputs.generate-changelog }}
+        CHANGELOG_FILE: ${{ inputs.changelog-file }}
+        GENERATE_RELEASE_NOTES: ${{ inputs.generate-release-notes }}
+        CHANGELOG_TEMPLATE: ${{ inputs.changelog-template }}
       run: |
-        cat > /tmp/.release-it.js << 'EOF'
+        # Determine template paths based on changelog-template input
+        if [ "$CHANGELOG_TEMPLATE" = "custom" ]; then
+          TEMPLATE_PATH="/tmp/template.hbs"
+          SETUP_PATH="/tmp/setup.js"
+          CHANGELOG_CMD="npx auto-changelog --commit-limit false --unreleased --template ${TEMPLATE_PATH} --handlebars-setup ${SETUP_PATH}"
+          GIT_CHANGELOG="npx auto-changelog --stdout --commit-limit false --unreleased --template ${TEMPLATE_PATH} --handlebars-setup ${SETUP_PATH}"
+        else
+          # Use compact template from release-it
+          CHANGELOG_CMD="npx auto-changelog --commit-limit false --unreleased --template https://raw.githubusercontent.com/release-it/release-it/main/templates/changelog-compact.hbs"
+          GIT_CHANGELOG="npx auto-changelog --stdout --commit-limit false --unreleased --template https://raw.githubusercontent.com/release-it/release-it/main/templates/changelog-compact.hbs"
+        fi
+        
+        # Build the after:npm:bump hooks
+        if [ "$GENERATE_CHANGELOG" = "true" ]; then
+          if [ "$CHANGELOG_TEMPLATE" = "custom" ]; then
+            # Custom template with full options 
+            HOOKS="'npx auto-changelog --commit-limit false -p --output ${CHANGELOG_FILE} --template ${TEMPLATE_PATH} --handlebars-setup ${SETUP_PATH} > /dev/null 2>&1'"
+          else
+            # Simple version
+            HOOKS="'npx auto-changelog -p --output ${CHANGELOG_FILE}'"
+          fi
+        else
+          HOOKS="''"
+        fi
+        
+        # Determine release notes command
+        if [ "$GENERATE_RELEASE_NOTES" = "true" ]; then
+          RELEASE_NOTES_CMD="\${changelog} --stdout --unreleased-only"
+        else
+          RELEASE_NOTES_CMD="echo 'Release v\${version}'"
+        fi
+        
+        # Determine commit message style
+        if [ "$CHANGELOG_TEMPLATE" = "custom" ]; then
+          COMMIT_MSG="chore(release): v\${version}"
+        else
+          COMMIT_MSG="chore: release v\${version}"
+        fi
+        
+        # Build conventional-changelog preset
+        if [ "$CHANGELOG_TEMPLATE" = "custom" ]; then
+          # Simple preset
+          PRESET="'conventionalcommits'"
+        else
+          # Detailed preset with types 
+          PRESET="{
+                        name: 'conventionalcommits',
+                        types: [
+                            { type: 'feat', section: 'Features' },
+                            { type: 'fix', section: 'Bug Fixes' },
+                            {}
+                        ]
+                    }"
+        fi
+        
+        cat > /tmp/.release-it.js << EOF
+        /* eslint-disable no-template-curly-in-string */
+        const changelog = \`${CHANGELOG_CMD}\`;
+
         module.exports = {
             plugins: {
                 '@release-it/conventional-changelog': {
-                    preset: 'conventionalcommits',
-                    infile: 'CHANGELOG.md',
                     gitRawCommitsOpts: {
                         path: '.',
                     },
+                    path: '.',
+                    preset: ${PRESET},
+                    infile: false,
                 },
             },
             git: {
-                commitMessage: "chore(release): v${version}",
+                commitMessage: "${COMMIT_MSG}",
                 requireCleanWorkingDir: false,
-                tagName: 'v${version}',
+                getLatestTagFromAllRefs: true,
                 pushArgs: ['--follow-tags'],
-                changelog: "npx auto-changelog --stdout --commit-limit false --unreleased --template /tmp/template.hbs --handlebars-setup /tmp/setup.js"
+                changelog: "${GIT_CHANGELOG}"
             },
             hooks: {
-                'after:bump': 'npx auto-changelog --commit-limit false --template /tmp/template.hbs --handlebars-setup /tmp/setup.js -p',
+                'after:npm:bump': ${HOOKS},
             },
             github: {
                 release: true,
-                releaseName: "v${version}",
-                releaseNotes: "npx auto-changelog --stdout --commit-limit false --unreleased-only --template /tmp/template.hbs --handlebars-setup /tmp/setup.js",
+                releaseName: "v\${version}",
+                releaseNotes: \`${RELEASE_NOTES_CMD}\`,
             },
             npm: {
                 publish: false,
-            }
+            },
+            verbose: true,
         };
         EOF
 
@@ -202,6 +283,16 @@ runs:
         echo "version=${VERSION}" >> $GITHUB_OUTPUT
         echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
         echo "release-url=https://github.com/${{ github.repository }}/releases/tag/v${VERSION}" >> $GITHUB_OUTPUT
+
+    - name: Commit and Push CHANGELOG
+      if: ${{ inputs.generate-changelog == 'true' }}
+      shell: bash
+      run: |
+        if [ -f "${{ inputs.changelog-file }}" ]; then
+          git add "${{ inputs.changelog-file }}"
+          git commit --amend --no-edit
+          git push --force-with-lease
+        fi
 
     - name: Package Extension
       if: ${{ inputs.publish-marketplace == 'true' }}
@@ -220,10 +311,18 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         VERSION=$(node -p "require('./package.json').version")
-        for file in ${{ inputs.upload-artifacts }}; do
+        shopt -s nullglob
+        files=(${{ inputs.upload-artifacts }})
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "No files matching pattern '${{ inputs.upload-artifacts }}' found"
+          exit 0
+        fi
+        for file in "${files[@]}"; do
           if [ -f "$file" ]; then
             echo "Uploading $file to release v${VERSION}"
             gh release upload "v${VERSION}" "$file" --clobber
+          else
+            echo "Warning: $file is not a file, skipping"
           fi
         done
 
