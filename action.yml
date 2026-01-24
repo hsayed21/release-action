@@ -1,4 +1,4 @@
-name: 'Release Action'
+name: 'Conventional Release Automator'
 description: 'Automated release workflow with conventional commits and changelog generation'
 author: hsayed
 
