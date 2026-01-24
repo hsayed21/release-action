@@ -1,0 +1,19 @@
+{
+  "name": "vscode-release-action",
+  "version": "1.0.0",
+  "description": "Automated release workflow for VS Code extensions with conventional commits and changelog generation",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hsayed21/vscode-release-action.git"
+  },
+  "keywords": [
+    "github-actions",
+    "release",
+    "vscode-extension",
+    "conventional-commits",
+    "changelog"
+  ],
+  "author": "hsayed",
+  "license": "MIT"
+}
