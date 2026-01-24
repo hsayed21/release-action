@@ -1,5 +1,5 @@
-name: 'VS Code Release Action'
-description: 'Automated release workflow for VS Code extensions with conventional commits and changelog generation'
+name: 'Release Action'
+description: 'Automated release workflow with conventional commits and changelog generation'
 author: hsayed
 
 inputs:
@@ -15,12 +15,20 @@ inputs:
     description: 'Command to build the project'
     required: false
     default: 'npm run build'
-  publish-marketplace:
-    description: 'Publish to VS Code Marketplace'
-    required: false
-    default: 'true'
   skip-build:
     description: 'Skip the build step'
+    required: false
+    default: 'false'
+  package-command:
+    description: 'Command to package artifacts (e.g., "npm pack" or "vsce package")'
+    required: false
+    default: ''
+  upload-artifacts:
+    description: 'Glob pattern of artifacts to upload to GitHub release (e.g., "*.vsix" or "*.tgz")'
+    required: false
+    default: ''
+  publish-marketplace:
+    description: 'Publish to VS Code Marketplace (requires vsce-pat)'
     required: false
     default: 'false'
   github-token:
@@ -77,7 +85,13 @@ runs:
 
     - name: Install release tools
       shell: bash
-      run: npm install -g @vscode/vsce release-it @release-it/conventional-changelog auto-changelog
+      run: |
+        # Install core release tools
+        npm install -g release-it @release-it/conventional-changelog auto-changelog
+        # Install vsce if marketplace publishing is enabled
+        if [ "${{ inputs.publish-marketplace }}" = "true" ]; then
+          npm install -g @vscode/vsce
+        fi
 
     - name: Create Handlebars Setup
       shell: bash
@@ -195,15 +209,24 @@ runs:
       shell: bash
       run: npx vsce package
 
-    - name: Upload VSIX to Release
-      if: ${{ inputs.publish-marketplace == 'true' }}
+    - name: Package Artifacts
+      if: ${{ inputs.package-command != '' }}
+      shell: bash
+      run: ${{ inputs.package-command }}
+
+    - name: Upload Artifacts to Release
+      if: ${{ inputs.upload-artifacts != '' }}
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         VERSION=$(node -p "require('./package.json').version")
-        PACKAGE_NAME=$(node -p "require('./package.json').name")
-        gh release upload "v${VERSION}" "${PACKAGE_NAME}-${VERSION}.vsix" --clobber
+        for file in ${{ inputs.upload-artifacts }}; do
+          if [ -f "$file" ]; then
+            echo "Uploading $file to release v${VERSION}"
+            gh release upload "v${VERSION}" "$file" --clobber
+          fi
+        done
 
     - name: Publish to VS Code Marketplace
       if: ${{ inputs.publish-marketplace == 'true' && inputs.vsce-pat != '' }}

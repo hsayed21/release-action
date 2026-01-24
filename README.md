@@ -1,14 +1,15 @@
-# 🚀 VS Code Release Action
+# 🚀 Release Action
 
-Automated release workflow for VS Code extensions with conventional commits and changelog generation.
+Automated release workflow with conventional commits and changelog generation.
 
 ## ✨ Features
 
 - 🏷️ **Automated Versioning** - Uses conventional commits to determine version bumps
 - 📝 **Changelog Generation** - Beautiful changelogs with emojis
-- 📦 **VS Code Marketplace** - Automatic publishing to marketplace
+- 📦 **Generic Artifact Upload** - Upload any build artifacts to GitHub releases
+- 🎨 **VS Code Marketplace** - Optional publishing to VS Code marketplace
 - 🔄 **Multiple Package Managers** - Supports npm, pnpm, and yarn
-- ⚡ **Flexible** - Customizable build commands and options
+- ⚡ **Flexible** - Customizable build and package commands
 
 ## 🎯 Quick Start
 
@@ -44,12 +45,14 @@ jobs:
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `github-token` | GitHub token for releases | Yes | `${{ github.token }}` |
-| `vsce-pat` | VS Code Marketplace token | No | `''` |
 | `node-version` | Node.js version | No | `'20'` |
 | `package-manager` | Package manager (npm/pnpm/yarn) | No | `'npm'` |
 | `build-command` | Build command | No | `'npm run build'` |
-| `publish-marketplace` | Publish to marketplace | No | `'true'` |
 | `skip-build` | Skip build step | No | `'false'` |
+| `package-command` | Command to package artifacts | No | `''` |
+| `upload-artifacts` | Glob pattern of files to upload | No | `''` |
+| `publish-marketplace` | Publish to VS Code Marketplace | No | `'false'` |
+| `vsce-pat` | VS Code Marketplace token | No | `''` |
 
 ## 📤 Outputs
 
@@ -78,13 +81,42 @@ Use these commit prefixes for automatic versioning:
 
 ## 📚 Examples
 
-### With pnpm
+### VS Code Extension - Upload VSIX to Release
 ```yaml
 - uses: hsayed21/vscode-release-action@v1
   with:
-    package-manager: pnpm
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    package-command: npx vsce package
+    upload-artifacts: '*.vsix'
+```
+
+### VS Code Extension - Publish to Marketplace
+```yaml
+- uses: hsayed21/vscode-release-action@v1
+  with:
     github-token: ${{ secrets.GITHUB_TOKEN }}
     vsce-pat: ${{ secrets.VSCE_PAT }}
+    publish-marketplace: true
+```
+
+### VS Code Extension - Both Upload & Publish
+```yaml
+- uses: hsayed21/vscode-release-action@v1
+  with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    vsce-pat: ${{ secrets.VSCE_PAT }}
+    package-command: npx vsce package
+    upload-artifacts: '*.vsix'
+    publish-marketplace: true
+```
+
+### Upload Multiple Artifacts
+```yaml
+- uses: hsayed21/vscode-release-action@v1
+  with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    package-command: npm run package
+    upload-artifacts: 'dist/*.zip dist/*.tar.gz *.vsix'
 ```
 
 ### Skip Build
@@ -92,14 +124,6 @@ Use these commit prefixes for automatic versioning:
 - uses: hsayed21/vscode-release-action@v1
   with:
     skip-build: true
-    github-token: ${{ secrets.GITHUB_TOKEN }}
-```
-
-### Custom Build Command
-```yaml
-- uses: hsayed21/vscode-release-action@v1
-  with:
-    build-command: pnpm build:prod
     github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
