@@ -1,0 +1,217 @@
+name: 'Release Action'
+description: 'Automated release workflow for VS Code extensions with conventional commits and changelog generation'
+author: hsayed'
+
+inputs:
+  node-version:
+    description: 'Node.js version to use'
+    required: false
+    default: '20'
+  package-manager:
+    description: 'Package manager to use (npm, pnpm, yarn)'
+    required: false
+    default: 'npm'
+  build-command:
+    description: 'Command to build the project'
+    required: false
+    default: 'npm run build'
+  publish-marketplace:
+    description: 'Publish to VS Code Marketplace'
+    required: false
+    default: 'true'
+  skip-build:
+    description: 'Skip the build step'
+    required: false
+    default: 'false'
+  github-token:
+    description: 'GitHub token for creating releases'
+    required: true
+    default: ${{ github.token }}
+  vsce-pat:
+    description: 'VS Code Marketplace Personal Access Token'
+    required: false
+    default: ''
+
+outputs:
+  version:
+    description: 'The version that was released'
+    value: ${{ steps.release.outputs.version }}
+  tag:
+    description: 'The git tag that was created'
+    value: ${{ steps.release.outputs.tag }}
+  release-url:
+    description: 'The URL of the created GitHub release'
+    value: ${{ steps.release.outputs.release-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: ${{ inputs.package-manager }}
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+          npm install -g pnpm
+          pnpm install
+        elif [ "${{ inputs.package-manager }}" = "yarn" ]; then
+          yarn install
+        else
+          npm ci
+        fi
+
+    - name: Build
+      if: ${{ inputs.skip-build != 'true' }}
+      shell: bash
+      run: ${{ inputs.build-command }}
+
+    - name: Configure Git
+      shell: bash
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Install release tools
+      shell: bash
+      run: npm install -g @vscode/vsce release-it @release-it/conventional-changelog auto-changelog
+
+    - name: Create Handlebars Setup
+      shell: bash
+      run: |
+        cat > /tmp/setup.js << 'EOF'
+        module.exports = function (Handlebars) {
+            Handlebars.registerHelper('replaceCommit', function (context) {
+                const commit = /.*?(chore|feat|fix|perf|refactor|style|docs|test|ci|build|deprecate)(\((.*?)\))?!?: (.*?)$/g;
+                const string = context.fn(this);
+                const parsed = Array.from(string.matchAll(commit) ?? [])[0] ?? [];
+                const [, type = '', , scope = '', title = ''] = parsed;
+                let result = "";
+                if (scope) {
+                    result = `${type}(${scope.toLowerCase()}): ${title}`
+                } else {
+                    result = `${type}: ${title}`;
+                }
+                let emoji = "";
+                switch (type) {
+                    case 'chore': emoji = "🔨"; break;
+                    case 'feat': emoji = "✨"; break;
+                    case 'fix': emoji = "🐞"; break;
+                    case 'perf': emoji = "⚡️"; break;
+                    case 'refactor': emoji = "♻️"; break;
+                    case 'style': emoji = "🎨"; break;
+                    case 'deprecate': emoji = "⚠️"; break;
+                    case 'docs': emoji = "📝"; break;
+                    case 'ci': emoji = "🤖"; break;
+                }
+                return `${emoji} ${result}` || 'empty commit name';
+            });
+
+            Handlebars.registerHelper('replaceTitle', function (context) {
+                const string = context.fn(this);
+                return string.replace('v', '');
+            });
+
+            Handlebars.registerHelper('commit-parser', (merges, commits, options) => {
+                const commitsFromMerges = merges.map((merge) => merge.commit);
+                const result = commits.concat(commitsFromMerges);
+                return options.fn(result);
+            });
+
+            Handlebars.registerHelper('lookup', function (obj, index) {
+                return obj[index];
+            });
+        };
+        EOF
+
+    - name: Create Handlebars Template
+      shell: bash
+      run: |
+        cat > /tmp/template.hbs << 'EOF'
+        {{#with (lookup releases 0)}}
+          {{#commit-parser merges commits}}
+              {{#commit-list this heading="# **What's Changed**" message='.*?(chore|feat|fix|perf|refactor|style|docs|test|ci|build|deprecate)(\(.*?\))?!?:' exclude='[bB]reaking [cC]hange:|[bB]reaking:|chore\(release\)' }}
+                - {{#replaceCommit}}{{subject}}{{/replaceCommit}} by @{{author}} [({{shorthash}})]({{href}})
+              {{/commit-list}}
+          {{/commit-parser}}
+          {{#if tag}}
+            **Full Changelog:** [{{diff}}]({{href}})
+          {{/if}}
+        {{/with}}
+        EOF
+
+    - name: Create Release-it Config
+      shell: bash
+      run: |
+        cat > /tmp/.release-it.js << 'EOF'
+        module.exports = {
+            plugins: {
+                '@release-it/conventional-changelog': {
+                    preset: 'conventionalcommits',
+                    infile: 'CHANGELOG.md',
+                    gitRawCommitsOpts: {
+                        path: '.',
+                    },
+                },
+            },
+            git: {
+                commitMessage: "chore(release): v${version}",
+                requireCleanWorkingDir: false,
+                tagName: 'v${version}',
+                pushArgs: ['--follow-tags'],
+                changelog: "npx auto-changelog --stdout --commit-limit false --unreleased --template /tmp/template.hbs --handlebars-setup /tmp/setup.js"
+            },
+            hooks: {
+                'after:bump': 'npx auto-changelog --commit-limit false --template /tmp/template.hbs --handlebars-setup /tmp/setup.js -p',
+            },
+            github: {
+                release: true,
+                releaseName: "v${version}",
+                releaseNotes: "npx auto-changelog --stdout --commit-limit false --unreleased-only --template /tmp/template.hbs --handlebars-setup /tmp/setup.js",
+            },
+            npm: {
+                publish: false,
+            }
+        };
+        EOF
+
+    - name: Run Release
+      id: release
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        npx release-it --ci --config /tmp/.release-it.js
+        VERSION=$(node -p "require('./package.json').version")
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
+        echo "release-url=https://github.com/${{ github.repository }}/releases/tag/v${VERSION}" >> $GITHUB_OUTPUT
+
+    - name: Package Extension
+      if: ${{ inputs.publish-marketplace == 'true' }}
+      shell: bash
+      run: npx vsce package
+
+    - name: Upload VSIX to Release
+      if: ${{ inputs.publish-marketplace == 'true' }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        VERSION=$(node -p "require('./package.json').version")
+        PACKAGE_NAME=$(node -p "require('./package.json').name")
+        gh release upload "v${VERSION}" "${PACKAGE_NAME}-${VERSION}.vsix" --clobber
+
+    - name: Publish to VS Code Marketplace
+      if: ${{ inputs.publish-marketplace == 'true' && inputs.vsce-pat != '' }}
+      shell: bash
+      env:
+        VSCE_PAT: ${{ inputs.vsce-pat }}
+      run: npx vsce publish -p $VSCE_PAT
+
+branding:
+  icon: 'package'
+  color: 'blue'
