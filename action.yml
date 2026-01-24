@@ -1,6 +1,6 @@
-name: 'Release Action'
+name: 'VS Code Release Action'
 description: 'Automated release workflow for VS Code extensions with conventional commits and changelog generation'
-author: hsayed'
+author: hsayed
 
 inputs:
   node-version:
