@@ -27,6 +27,7 @@ jobs:
         with:
           version: ${{ github.event.inputs.version }}
           # include-non-conventional: false
+          # generate-changelog: false
           # files-pattern: 'dist/*.zip'
           # publish-vsce: false
           # node-version: '24'
@@ -43,6 +44,7 @@ jobs:
 | `publish-vsce` | Publish to VS Code Marketplace | No | `false` |
 | `files-pattern` | Extra files to upload | No | `''` |
 | `include-non-conventional` | Include non-conventional commits | No | `false` |
+| `generate-changelog` | Generate CHANGELOG.md file | No | `false` |
 | `node-version` | Node.js version for VSCE publish | No | `24` |
 
 ## Secrets

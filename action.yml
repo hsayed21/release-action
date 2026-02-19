@@ -24,6 +24,11 @@ inputs:
     required: false
     default: false
     type: boolean
+  generate-changelog:
+    description: 'Generate CHANGELOG.md file'
+    required: false
+    default: false
+    type: boolean
   node-version:
     description: 'Node.js version to use'
     required: false
@@ -45,6 +50,8 @@ runs:
   steps:
     - name: Checkout
       uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
 
     - name: Setup Node.js
       uses: actions/setup-node@v6
@@ -74,14 +81,18 @@ runs:
       shell: bash
       run: git push origin HEAD --follow-tags
 
-    # - name: Install dependencies
-    #   shell: bash
-    #   run: npm ci
+    - name: Generate CHANGELOG.md
+      if: ${{ inputs.generate-changelog == 'true' }}
+      shell: bash
+      run: 'npx auto-changelog --hide-credit --hide-empty-releases --ignore-commit-pattern "^chore: release"'
 
-    # - name: Build extension
-    #   shell: bash
-    #   run: npm run build
-    #   continue-on-error: true
+    - name: Commit CHANGELOG
+      if: ${{ inputs.generate-changelog == 'true' }}
+      shell: bash
+      run: |
+        git add CHANGELOG.md
+        git commit --amend --no-edit
+        git push origin HEAD --force-with-lease
 
     - name: Publish & package extension
       if: ${{ inputs.publish-vsce == 'true' }}
