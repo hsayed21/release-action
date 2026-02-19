@@ -3,58 +3,31 @@ description: 'Automated release workflow with conventional commits and changelog
 author: hsayed
 
 inputs:
+  version:
+    description: 'Semver bump type'
+    required: true
+    type: choice
+    options: [patch, minor, major]
+    default: patch
+  include-non-conventional:
+    description: 'Include non-conventional commits in release notes'
+    required: false
+    default: false
+    type: boolean
+  files-pattern:
+    description: 'Extra files to upload (glob, e.g. dist/*.zip)'
+    required: false
+    default: ''
+    type: string
+  publish-vsce:
+    description: 'Publish to VS Code Marketplace'
+    required: false
+    default: false
+    type: boolean
   node-version:
     description: 'Node.js version to use'
     required: false
-    default: '20'
-  package-manager:
-    description: 'Package manager to use (npm, pnpm, yarn)'
-    required: false
-    default: 'npm'
-  build-command:
-    description: 'Command to build the project'
-    required: false
-    default: 'npm run build'
-  skip-build:
-    description: 'Skip the build step'
-    required: false
-    default: 'false'
-  package-command:
-    description: 'Command to package artifacts (e.g., "npm pack" or "vsce package")'
-    required: false
-    default: ''
-  upload-artifacts:
-    description: 'Glob pattern of artifacts to upload to GitHub release (e.g., "*.vsix" or "*.tgz")'
-    required: false
-    default: ''
-  generate-changelog:
-    description: 'Generate and commit CHANGELOG.md file to repository'
-    required: false
-    default: 'false'
-  changelog-file:
-    description: 'Path to the changelog file'
-    required: false
-    default: 'CHANGELOG.md'
-  changelog-template:
-    description: 'Changelog template type: "custom" (uses handlebars templates) or "compact" (uses release-it default)'
-    required: false
-    default: 'custom'
-  generate-release-notes:
-    description: 'Generate release notes for GitHub release'
-    required: false
-    default: 'true'
-  publish-marketplace:
-    description: 'Publish to VS Code Marketplace (requires vsce-pat)'
-    required: false
-    default: 'false'
-  github-token:
-    description: 'GitHub token for creating releases'
-    required: true
-    default: ${{ github.token }}
-  vsce-pat:
-    description: 'VS Code Marketplace Personal Access Token'
-    required: false
-    default: ''
+    default: '24'
 
 outputs:
   version:
@@ -70,268 +43,146 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v6
       with:
         node-version: ${{ inputs.node-version }}
 
-    - name: Install dependencies
+    - name: Configure Git identity
       shell: bash
       run: |
-        if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-          npm install -g pnpm
-          pnpm install
-        elif [ "${{ inputs.package-manager }}" = "yarn" ]; then
-          yarn install
-        else
-          npm install
-        fi
-
-    - name: Build
-      if: ${{ inputs.skip-build != 'true' }}
-      shell: bash
-      run: ${{ inputs.build-command }}
-
-    - name: Configure Git
-      shell: bash
-      run: |
-        git config user.name "github-actions[bot]"
+        git config user.name  "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
-    - name: Install release tools
+    - name: Save rollback info
+      id: rollback-save
       shell: bash
       run: |
-        # Install core release tools
-        npm install -g release-it @release-it/conventional-changelog auto-changelog
-        # Install vsce if marketplace publishing is enabled
-        if [ "${{ inputs.publish-marketplace }}" = "true" ]; then
-          npm install -g @vscode/vsce
-        fi
+        echo "previous-commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
-    - name: Create Handlebars Setup
+    - name: Bump version & create tag
+      id: bump
       shell: bash
       run: |
-        cat > /tmp/setup.js << 'EOF'
-        module.exports = function (Handlebars) {
-            Handlebars.registerHelper('replaceCommit', function (context) {
-                const commit = /.*?(chore|feat|fix|perf|refactor|style|docs|test|ci|build|deprecate)(\((.*?)\))?!?: (.*?)$/g;
-                const string = context.fn(this);
-                const parsed = Array.from(string.matchAll(commit) ?? [])[0] ?? [];
-                const [, type = '', , scope = '', title = ''] = parsed;
-                let result = "";
-                if (scope) {
-                    result = `${type}(${scope.toLowerCase()}): ${title}`
-                } else {
-                    result = `${type}: ${title}`;
-                }
-                let emoji = "";
-                switch (type) {
-                    case 'chore': emoji = "🔨"; break;
-                    case 'feat': emoji = "✨"; break;
-                    case 'fix': emoji = "🐞"; break;
-                    case 'perf': emoji = "⚡️"; break;
-                    case 'refactor': emoji = "♻️"; break;
-                    case 'style': emoji = "🎨"; break;
-                    case 'deprecate': emoji = "⚠️"; break;
-                    case 'docs': emoji = "📝"; break;
-                    case 'ci': emoji = "🤖"; break;
-                }
-                return `${emoji} ${result}` || 'empty commit name';
-            });
+        npm version ${{ inputs.version }} -m "chore: release %s"
+        echo "tag=$(git describe --tags --abbrev=0)" >> $GITHUB_OUTPUT
 
-            Handlebars.registerHelper('replaceTitle', function (context) {
-                const string = context.fn(this);
-                return string.replace('v', '');
-            });
-
-            Handlebars.registerHelper('commit-parser', (merges, commits, options) => {
-                const commitsFromMerges = merges.map((merge) => merge.commit);
-                const result = commits.concat(commitsFromMerges);
-                return options.fn(result);
-            });
-
-            Handlebars.registerHelper('lookup', function (obj, index) {
-                return obj[index];
-            });
-        };
-        EOF
-
-    - name: Create Handlebars Template
+    - name: Push commit & tag
       shell: bash
-      run: |
-        cat > /tmp/template.hbs << 'EOF'
-        {{#with (lookup releases 0)}}
-          {{#commit-parser merges commits}}
-              {{#commit-list this heading="# **What's Changed**" message='.*?(chore|feat|fix|perf|refactor|style|docs|test|ci|build|deprecate)(\(.*?\))?!?:' exclude='[bB]reaking [cC]hange:|[bB]reaking:|chore\(release\)' }}
-                - {{#replaceCommit}}{{subject}}{{/replaceCommit}} by @{{author}} [({{shorthash}})]({{href}})
-              {{/commit-list}}
-          {{/commit-parser}}
-          {{#if tag}}
-            **Full Changelog:** [{{diff}}]({{href}})
-          {{/if}}
-        {{/with}}
-        EOF
+      run: git push origin HEAD --follow-tags
 
-    - name: Create Release-it Config
-      shell: bash
+    # - name: Install dependencies
+    #   shell: bash
+    #   run: npm ci
+
+    # - name: Build extension
+    #   shell: bash
+    #   run: npm run build
+    #   continue-on-error: true
+
+    - name: Publish & package extension
+      if: ${{ inputs.publish-vsce == 'true' }}
+      id: publish
+      uses: HaaLeo/publish-vscode-extension@v2
+      with:
+        pat:         ${{ secrets.VSCE_PAT }}
+        registryUrl: https://marketplace.visualstudio.com
+
+    - name: Write changelog config
       env:
-        GENERATE_CHANGELOG: ${{ inputs.generate-changelog }}
-        CHANGELOG_FILE: ${{ inputs.changelog-file }}
-        GENERATE_RELEASE_NOTES: ${{ inputs.generate-release-notes }}
-        CHANGELOG_TEMPLATE: ${{ inputs.changelog-template }}
+        INCLUDE_NON_CONV: ${{ inputs.include-non-conventional }}
+        REPO_URL:         ${{ github.server_url }}/${{ github.repository }}
+      shell: bash
       run: |
-        # Determine template paths based on changelog-template input
-        if [ "$CHANGELOG_TEMPLATE" = "custom" ]; then
-          TEMPLATE_PATH="/tmp/template.hbs"
-          SETUP_PATH="/tmp/setup.js"
-          CHANGELOG_CMD="npx auto-changelog --commit-limit false --unreleased --template ${TEMPLATE_PATH} --handlebars-setup ${SETUP_PATH}"
-          GIT_CHANGELOG="npx auto-changelog --stdout --commit-limit false --unreleased --template ${TEMPLATE_PATH} --handlebars-setup ${SETUP_PATH}"
-        else
-          # Use compact template from release-it
-          CHANGELOG_CMD="npx auto-changelog --commit-limit false --unreleased --template https://raw.githubusercontent.com/release-it/release-it/main/templates/changelog-compact.hbs"
-          GIT_CHANGELOG="npx auto-changelog --stdout --commit-limit false --unreleased --template https://raw.githubusercontent.com/release-it/release-it/main/templates/changelog-compact.hbs"
-        fi
-        
-        # Build the after:npm:bump hooks
-        if [ "$GENERATE_CHANGELOG" = "true" ]; then
-          if [ "$CHANGELOG_TEMPLATE" = "custom" ]; then
-            # Custom template with full options 
-            HOOKS="'npx auto-changelog --commit-limit false -p --output ${CHANGELOG_FILE} --template ${TEMPLATE_PATH} --handlebars-setup ${SETUP_PATH} > /dev/null 2>&1'"
-          else
-            # Simple version
-            HOOKS="'npx auto-changelog -p --output ${CHANGELOG_FILE}'"
-          fi
-        else
-          HOOKS="''"
-        fi
-        
-        # Determine release notes command
-        if [ "$GENERATE_RELEASE_NOTES" = "true" ]; then
-          RELEASE_NOTES_CMD="\${changelog} --stdout --unreleased-only"
-        else
-          RELEASE_NOTES_CMD="echo 'Release v\${version}'"
-        fi
-        
-        # Determine commit message style
-        if [ "$CHANGELOG_TEMPLATE" = "custom" ]; then
-          COMMIT_MSG="chore(release): v\${version}"
-        else
-          COMMIT_MSG="chore: release v\${version}"
-        fi
-        
-        # Build conventional-changelog preset
-        if [ "$CHANGELOG_TEMPLATE" = "custom" ]; then
-          # Simple preset
-          PRESET="'conventionalcommits'"
-        else
-          # Detailed preset with types 
-          PRESET="{
-                        name: 'conventionalcommits',
-                        types: [
-                            { type: 'feat', section: 'Features' },
-                            { type: 'fix', section: 'Bug Fixes' },
-                            {}
-                        ]
-                    }"
-        fi
-        
-        cat > /tmp/.release-it.js << EOF
-        /* eslint-disable no-template-curly-in-string */
-        const changelog = \`${CHANGELOG_CMD}\`;
+        python3 << 'PYEOF'
+        import json, os
 
-        module.exports = {
-            plugins: {
-                '@release-it/conventional-changelog': {
-                    gitRawCommitsOpts: {
-                        path: '.',
-                    },
-                    path: '.',
-                    preset: ${PRESET},
-                    infile: false,
-                },
-            },
-            git: {
-                commitMessage: "${COMMIT_MSG}",
-                requireCleanWorkingDir: false,
-                getLatestTagFromAllRefs: true,
-                pushArgs: ['--follow-tags'],
-                changelog: "${GIT_CHANGELOG}"
-            },
-            hooks: {
-                'after:npm:bump': ${HOOKS},
-            },
-            github: {
-                release: true,
-                releaseName: "v\${version}",
-                releaseNotes: \`${RELEASE_NOTES_CMD}\`,
-            },
-            npm: {
-                publish: false,
-            },
-            verbose: true,
-        };
-        EOF
+        include_non_conv = os.environ.get("INCLUDE_NON_CONV", "false").lower() == "true"
+        repo             = os.environ.get("REPO_URL", "")
 
-    - name: Run Release
+        CONV = r"^.{0,6}(?!chore:\s*release)(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert):"
+        ALL  = r"^(?!.{0,6}chore:\s*release)"
+
+        config = {
+          "categories": [
+            {
+              "title": "## What's Changed",
+              "rules": [{"pattern": ALL if include_non_conv else CONV, "on_property": "title"}]
+            }
+          ],
+          "ignore_labels": ["ignore"],
+          "sort": {"order": "DESC", "on_property": "mergedAt"},
+          "template":      "#{{CHANGELOG}}\n\n**Full Changelog**: [`#{{FROM_TAG}}...#{{TO_TAG}}`](" + repo + "/compare/#{{FROM_TAG}}...#{{TO_TAG}})",
+          "pr_template":   "- #{{TITLE}} by @#{{AUTHOR}} ([`#{{MERGE_SHA}}`](" + repo + "/commit/#{{MERGE_SHA}}))",
+          "empty_template": "_No changes in this release._",
+          "trim_values":    True
+        }
+
+        out = json.dumps(config, indent=2, ensure_ascii=False)
+        with open(".changelog-config.json", "w") as f:
+          f.write(out)
+        print(out)
+        PYEOF
+
+    - name: Generate changelog
+      id: changelog
+      uses: mikepenz/release-changelog-builder-action@v5
+      with:
+        token:         ${{ secrets.GITHUB_TOKEN }}
+        toTag:         ${{ steps.bump.outputs.tag }}
+        configuration: .changelog-config.json
+        mode:          "COMMIT"
+
+    - name: Shorten commit hashes
+      id: notes
+      shell: bash
+      run: |
+        NOTES=$(cat << 'NOTES_EOF'
+        ${{ steps.changelog.outputs.changelog }}
+        NOTES_EOF
+        )
+        NOTES=$(echo "$NOTES" | sed -E 's/([a-f0-9]{7})[a-f0-9]{33}/\1/g')
+        {
+          echo "changelog<<EOF"
+          echo "$NOTES"
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
+
+    - name: Create GitHub release
       id: release
-      shell: bash
-      env:
-        GITHUB_TOKEN: ${{ inputs.github-token }}
-      run: |
-        npx release-it --ci --config /tmp/.release-it.js
-        VERSION=$(node -p "require('./package.json').version")
-        echo "version=${VERSION}" >> $GITHUB_OUTPUT
-        echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
-        echo "release-url=https://github.com/${{ github.repository }}/releases/tag/v${VERSION}" >> $GITHUB_OUTPUT
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.bump.outputs.tag }}
+        body:     ${{ steps.notes.outputs.changelog }}
+        files: |
+          *.vsix
+          ${{ inputs.files-pattern }}
 
-    - name: Commit and Push CHANGELOG
-      if: ${{ inputs.generate-changelog == 'true' }}
+    - name: Set outputs
       shell: bash
       run: |
-        if [ -f "${{ inputs.changelog-file }}" ]; then
-          git add "${{ inputs.changelog-file }}"
-          git commit --amend --no-edit
-          git push --force-with-lease
-        fi
+        echo "version=$(echo ${{ steps.bump.outputs.tag }} | sed 's/v//')" >> $GITHUB_OUTPUT
+        echo "tag=${{ steps.bump.outputs.tag }}" >> $GITHUB_OUTPUT
+        echo "release-url=https://github.com/${{ github.repository }}/releases/tag/${{ steps.bump.outputs.tag }}" >> $GITHUB_OUTPUT
 
-    - name: Package Extension
-      if: ${{ inputs.publish-marketplace == 'true' }}
+    - name: Rollback on failure
+      if: failure()
       shell: bash
-      run: npx vsce package
-
-    - name: Package Artifacts
-      if: ${{ inputs.package-command != '' }}
-      shell: bash
-      run: ${{ inputs.package-command }}
-
-    - name: Upload Artifacts to Release
-      if: ${{ inputs.upload-artifacts != '' }}
-      shell: bash
-      env:
-        GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
-        VERSION=$(node -p "require('./package.json').version")
-        shopt -s nullglob
-        files=(${{ inputs.upload-artifacts }})
-        if [ ${#files[@]} -eq 0 ]; then
-          echo "No files matching pattern '${{ inputs.upload-artifacts }}' found"
-          exit 0
-        fi
-        for file in "${files[@]}"; do
-          if [ -f "$file" ]; then
-            echo "Uploading $file to release v${VERSION}"
-            gh release upload "v${VERSION}" "$file" --clobber
-          else
-            echo "Warning: $file is not a file, skipping"
-          fi
-        done
-
-    - name: Publish to VS Code Marketplace
-      if: ${{ inputs.publish-marketplace == 'true' && inputs.vsce-pat != '' }}
-      shell: bash
-      env:
-        VSCE_PAT: ${{ inputs.vsce-pat }}
-      run: npx vsce publish -p $VSCE_PAT
+        echo "::error::Release failed — rolling back tag and commit..."
+        
+        TAG="${{ steps.bump.outputs.tag }}"
+        PREV="${{ steps.rollback-save.outputs.previous-commit }}"
+        
+        git push --delete origin "$TAG" 2>/dev/null || echo "Remote tag not found"
+        git tag -d "$TAG" 2>/dev/null || echo "Local tag not found"
+        git reset --hard "$PREV"
+        git push origin HEAD --force
+        
+        echo "::error::Rollback complete — tag and commit have been rolled back."
 
 branding:
   icon: 'package'
