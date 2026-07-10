@@ -9,6 +9,18 @@ inputs:
     type: choice
     options: [patch, minor, major]
     default: patch
+  release-version:
+    description: 'Optional exact version to release instead of calculating a bump'
+    required: false
+    default: ''
+  release-command:
+    description: 'Optional command to run after versioning and before publishing the release'
+    required: false
+    default: ''
+  release-command-shell:
+    description: 'Shell used to run release-command'
+    required: false
+    default: 'bash'
   include-non-conventional:
     description: 'Include non-conventional commits in release notes'
     required: false
@@ -33,17 +45,21 @@ inputs:
     description: 'Node.js version to use'
     required: false
     default: '24'
+  initial-version:
+    description: 'Initial semver version when package.json is created automatically'
+    required: false
+    default: '0.0.0'
 
 outputs:
   version:
     description: 'The version that was released'
-    value: ${{ steps.release.outputs.version }}
+    value: ${{ steps.set-outputs.outputs.version }}
   tag:
     description: 'The git tag that was created'
-    value: ${{ steps.release.outputs.tag }}
+    value: ${{ steps.set-outputs.outputs.tag }}
   release-url:
     description: 'The URL of the created GitHub release'
-    value: ${{ steps.release.outputs.release-url }}
+    value: ${{ steps.set-outputs.outputs.release-url }}
 
 runs:
   using: 'composite'
@@ -73,9 +89,36 @@ runs:
     - name: Bump version & create tag
       id: bump
       shell: bash
+      env:
+        INITIAL_VERSION: ${{ inputs.initial-version }}
       run: |
-        npm version ${{ inputs.version }} -m "chore: release %s"
-        echo "tag=$(git describe --tags --abbrev=0)" >> $GITHUB_OUTPUT
+        npm_version_args=()
+
+        if [[ ! -f package.json ]]; then
+          node -e 'const fs = require("fs"); fs.writeFileSync("package.json", JSON.stringify({ name: "release-package", version: process.env.INITIAL_VERSION, private: true }, null, 2) + "\n")'
+          echo "package.json was missing; created a version manifest."
+          # The newly created, untracked manifest makes npm see a dirty tree.
+          # Force lets npm stage it and include it in its release commit.
+          npm_version_args+=(--force)
+        fi
+
+        requested_version="${{ inputs.release-version }}"
+        if [[ -z "$requested_version" ]]; then
+          requested_version="${{ inputs.version }}"
+        fi
+
+        npm version "$requested_version" -m "chore: release %s" "${npm_version_args[@]}"
+        tag=$(git describe --tags --abbrev=0)
+        echo "tag=$tag" >> $GITHUB_OUTPUT
+        echo "version=${tag#v}" >> $GITHUB_OUTPUT
+
+    - name: Run release command
+      if: ${{ inputs.release-command != '' }}
+      shell: ${{ inputs.release-command-shell }}
+      env:
+        RELEASE_VERSION: ${{ steps.bump.outputs.version }}
+        RELEASE_TAG: ${{ steps.bump.outputs.tag }}
+      run: ${{ inputs.release-command }}
 
     - name: Push commit & tag
       shell: bash
@@ -99,7 +142,7 @@ runs:
       id: publish
       uses: HaaLeo/publish-vscode-extension@v2
       with:
-        pat:         ${{ secrets.VSCE_PAT }}
+        pat:         ${{ env.VSCE_PAT }}
         registryUrl: https://marketplace.visualstudio.com
 
     - name: Write changelog config
@@ -142,7 +185,7 @@ runs:
       id: changelog
       uses: mikepenz/release-changelog-builder-action@v5
       with:
-        token:         ${{ secrets.GITHUB_TOKEN }}
+        token:         ${{ env.GITHUB_TOKEN }}
         toTag:         ${{ steps.bump.outputs.tag }}
         configuration: .changelog-config.json
         mode:          "COMMIT"
@@ -169,13 +212,14 @@ runs:
         tag_name: ${{ steps.bump.outputs.tag }}
         body:     ${{ steps.notes.outputs.changelog }}
         files: |
-          *.vsix
+          ${{ inputs.publish-vsce == 'true' && '*.vsix' || '' }}
           ${{ inputs.files-pattern }}
 
     - name: Set outputs
+      id: set-outputs
       shell: bash
       run: |
-        echo "version=$(echo ${{ steps.bump.outputs.tag }} | sed 's/v//')" >> $GITHUB_OUTPUT
+        echo "version=${{ steps.bump.outputs.version }}" >> $GITHUB_OUTPUT
         echo "tag=${{ steps.bump.outputs.tag }}" >> $GITHUB_OUTPUT
         echo "release-url=https://github.com/${{ github.repository }}/releases/tag/${{ steps.bump.outputs.tag }}" >> $GITHUB_OUTPUT
 
