@@ -18,6 +18,11 @@ on:
         default: patch
         type: choice
         options: [patch, minor, major]
+      update_latest:
+        description: Update the latest release instead of creating a new one
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -29,6 +34,7 @@ jobs:
       - uses: hsayed21/release-action@v1
         with:
           version: ${{ inputs.version }}
+          update-latest-release: ${{ inputs.update_latest }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
@@ -47,6 +53,11 @@ on:
         default: patch
         type: choice
         options: [patch, minor, major]
+      update_latest:
+        description: Update the latest release instead of creating a new one
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -59,6 +70,7 @@ jobs:
       - uses: hsayed21/release-action@v1
         with:
           version: ${{ inputs.version }}
+          update-latest-release: ${{ inputs.update_latest }}
           initial-version: '0.0.0'
           release-command-shell: bash
           release-command: |
@@ -87,6 +99,7 @@ jobs:
 | Input | Description | Required | Default |
 |---|---|---|---|
 | `version` | Semver bump: `patch`, `minor`, or `major`. | Yes | `patch` |
+| `update-latest-release` | Rebuild and update the latest published release without changing its version. | No | `false` |
 | `initial-version` | Initial version used by the action. | No | `0.0.0` |
 | `release-command` | Command to run before publishing the release. | No | `''` |
 | `release-command-shell` | Shell used for `release-command`. | No | `bash` |

@@ -11,6 +11,11 @@ inputs:
     description: 'Optional exact version to release instead of calculating a bump'
     required: false
     default: ''
+  update-latest-release:
+    description: 'Rebuild and update the latest published release without changing its version'
+    required: false
+    default: false
+    type: boolean
   release-command:
     description: 'Optional command to run after versioning and before publishing the release'
     required: false
@@ -86,11 +91,15 @@ runs:
       run: |
         echo "previous-commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-    - name: Bump version & create tag
+    - name: Resolve release version and tag
       id: bump
       shell: bash
       env:
         INITIAL_VERSION: ${{ inputs.initial-version }}
+        UPDATE_LATEST_RELEASE: ${{ inputs.update-latest-release }}
+        GH_TOKEN: ${{ env.GITHUB_TOKEN }}
+        GH_API_URL: ${{ github.api_url }}
+        GH_REPOSITORY: ${{ github.repository }}
       run: |
         npm_version_args=()
         previous_tag=''
@@ -101,6 +110,64 @@ runs:
             break
           fi
         done < <(git tag --list 'v*' --sort=-version:refname)
+
+        if [[ "$UPDATE_LATEST_RELEASE" == "true" ]]; then
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::GITHUB_TOKEN is required to resolve the latest published release."
+            exit 1
+          fi
+
+          tag=$(
+            curl --silent --show-error --fail-with-body \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$GH_API_URL/repos/$GH_REPOSITORY/releases/latest" |
+              node -e '
+                let json = "";
+                process.stdin.setEncoding("utf8");
+                process.stdin.on("data", chunk => json += chunk);
+                process.stdin.on("end", () => {
+                  const release = JSON.parse(json);
+                  if (!release.tag_name) throw new Error("Latest release does not have a tag.");
+                  if (release.immutable) throw new Error("Latest release is immutable and cannot be updated.");
+                  process.stdout.write(release.tag_name);
+                });
+              '
+          )
+
+          if [[ ! "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Latest release tag '$tag' is not a supported stable semantic version."
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/$tag"; then
+            echo "::error::Latest release tag '$tag' was not fetched from the repository."
+            exit 1
+          fi
+
+          previous_tag_object=$(git rev-parse "refs/tags/$tag")
+          previous_tag_commit=$(git rev-parse "$tag^{commit}")
+
+          if ! git merge-base --is-ancestor "$previous_tag_commit" HEAD; then
+            echo "::error::Latest release tag '$tag' is not an ancestor of the current commit."
+            exit 1
+          fi
+
+          commits_after_release=$(git rev-list --count "$previous_tag_commit..HEAD")
+          if [[ "$commits_after_release" -eq 0 ]]; then
+            echo "::error::There are no commits after the latest release '$tag'."
+            exit 1
+          fi
+
+          echo "mode=update" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "previous-tag-object=$previous_tag_object" >> "$GITHUB_OUTPUT"
+          echo "previous-tag-commit=$previous_tag_commit" >> "$GITHUB_OUTPUT"
+          echo "commits-after-release=$commits_after_release" >> "$GITHUB_OUTPUT"
+          echo "Updating release $tag with $commits_after_release new commit(s)."
+          exit 0
+        fi
 
         if [[ ! -f package.json ]]; then
           node -e 'const fs = require("fs"); fs.writeFileSync("package.json", JSON.stringify({ name: "release-package", version: process.env.INITIAL_VERSION, private: true }, null, 2) + "\n")'
@@ -135,8 +202,10 @@ runs:
 
         npm version "$requested_version" -m "chore: release %s" "${npm_version_args[@]}"
         tag=$(git describe --tags --abbrev=0)
+        echo "mode=new" >> "$GITHUB_OUTPUT"
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
         echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+        echo "previous-tag-object=" >> "$GITHUB_OUTPUT"
 
     - name: Run release command
       if: ${{ inputs.release-command != '' }}
@@ -145,6 +214,13 @@ runs:
         RELEASE_VERSION: ${{ steps.bump.outputs.version }}
         RELEASE_TAG: ${{ steps.bump.outputs.tag }}
       run: ${{ inputs.release-command }}
+
+    - name: Move latest release tag
+      if: ${{ inputs.update-latest-release == 'true' }}
+      shell: bash
+      run: |
+        git tag --force --annotate "${{ steps.bump.outputs.tag }}" \
+          --message "Update release ${{ steps.bump.outputs.tag }}" HEAD
 
     - name: Generate CHANGELOG.md
       if: ${{ inputs.generate-changelog == 'true' }}
@@ -156,15 +232,45 @@ runs:
       shell: bash
       run: |
         git add CHANGELOG.md
-        git commit --amend --no-edit
+
+        if ! git diff --cached --quiet; then
+          if [[ "${{ steps.bump.outputs.mode }}" == "update" ]]; then
+            git commit --message "chore: release ${{ steps.bump.outputs.version }} (update)"
+          else
+            git commit --amend --no-edit
+          fi
+        fi
+
         git tag --force --annotate "${{ steps.bump.outputs.tag }}" --message "Release ${{ steps.bump.outputs.tag }}"
 
     - name: Push commit & tag
       id: push
       shell: bash
       run: |
-        git push --atomic origin HEAD "refs/tags/${{ steps.bump.outputs.tag }}"
+        TAG="${{ steps.bump.outputs.tag }}"
+        MODE="${{ steps.bump.outputs.mode }}"
+        BRANCH=$(git symbolic-ref --quiet --short HEAD || true)
+        PUSHED_COMMIT=$(git rev-parse HEAD)
+
+        if [[ -z "$BRANCH" ]]; then
+          echo "::error::Releases must run from a branch, not a detached HEAD."
+          exit 1
+        fi
+
+        if [[ "$MODE" == "update" ]]; then
+          OLD_TAG_OBJECT="${{ steps.bump.outputs.previous-tag-object }}"
+          git push --atomic \
+            --force-with-lease="refs/tags/$TAG:$OLD_TAG_OBJECT" \
+            origin HEAD "refs/tags/$TAG"
+        else
+          git push --atomic origin HEAD "refs/tags/$TAG"
+        fi
+
         echo "completed=true" >> "$GITHUB_OUTPUT"
+        echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+        echo "pushed-commit=$PUSHED_COMMIT" >> "$GITHUB_OUTPUT"
+        TAG_OBJECT=$(git rev-parse "refs/tags/$TAG")
+        echo "tag-object=$TAG_OBJECT" >> "$GITHUB_OUTPUT"
 
     - name: Publish & package extension
       if: ${{ inputs.publish-vsce == 'true' }}
@@ -235,12 +341,13 @@ runs:
           echo "EOF"
         } >> "$GITHUB_OUTPUT"
 
-    - name: Create GitHub release
+    - name: Create or update GitHub release
       id: release
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ steps.bump.outputs.tag }}
         body:     ${{ steps.notes.outputs.changelog }}
+        overwrite_files: true
         files: |
           ${{ inputs.publish-vsce == 'true' && '*.vsix' || '' }}
           ${{ inputs.files-pattern }}
@@ -250,27 +357,49 @@ runs:
       shell: bash
       run: |
         echo "::error::Release failed — rolling back tag and commit..."
-        
+
         TAG="${{ steps.bump.outputs.tag }}"
+        MODE="${{ steps.bump.outputs.mode }}"
         PREV="${{ steps.rollback-save.outputs.previous-commit }}"
+        OLD_TAG_OBJECT="${{ steps.bump.outputs.previous-tag-object }}"
+        NEW_TAG_OBJECT="${{ steps.push.outputs.tag-object }}"
+        PUSHED_COMMIT="${{ steps.push.outputs.pushed-commit }}"
+        BRANCH="${{ steps.push.outputs.branch }}"
+        PUSH_COMPLETED="${{ steps.push.outputs.completed }}"
 
-        if [[ "${{ steps.push.outputs.completed }}" == "true" ]]; then
-          git push --delete origin "$TAG" 2>/dev/null || echo "Remote tag not found"
-        else
-          echo "Remote tag was not pushed by this run; leaving remote tags unchanged."
-        fi
+        if [[ "$MODE" == "update" && -n "$TAG" && -n "$OLD_TAG_OBJECT" ]]; then
+          git update-ref "refs/tags/$TAG" "$OLD_TAG_OBJECT"
 
-        if [[ -n "$TAG" ]]; then
+          if [[ "$PUSH_COMPLETED" == "true" && -n "$NEW_TAG_OBJECT" ]]; then
+            git push \
+              --force-with-lease="refs/tags/$TAG:$NEW_TAG_OBJECT" \
+              origin "refs/tags/$TAG:refs/tags/$TAG" \
+              || echo "Failed to restore remote tag $TAG"
+          else
+            echo "Remote tag was not updated by this run; leaving it unchanged."
+          fi
+        elif [[ -n "$TAG" ]]; then
+          if [[ "$PUSH_COMPLETED" == "true" && -n "$NEW_TAG_OBJECT" ]]; then
+            git push \
+              --force-with-lease="refs/tags/$TAG:$NEW_TAG_OBJECT" \
+              origin ":refs/tags/$TAG" \
+              || echo "Failed to delete remote tag $TAG"
+          fi
+
           git tag -d "$TAG" 2>/dev/null || echo "Local tag not found"
         fi
 
         if [[ -n "$PREV" ]]; then
           git reset --hard "$PREV"
-          if [[ "${{ steps.push.outputs.completed }}" == "true" ]]; then
-            git push origin HEAD --force-with-lease
+
+          if [[ "$PUSH_COMPLETED" == "true" && -n "$BRANCH" && -n "$PUSHED_COMMIT" ]]; then
+            git push \
+              --force-with-lease="refs/heads/$BRANCH:$PUSHED_COMMIT" \
+              origin "HEAD:refs/heads/$BRANCH" \
+              || echo "Failed to restore remote branch $BRANCH"
           fi
         fi
-        
+
         echo "::error::Rollback complete — tag and commit have been rolled back."
 
 branding:
