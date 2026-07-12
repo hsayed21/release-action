@@ -6,8 +6,6 @@ inputs:
   version:
     description: 'Semver bump type'
     required: true
-    type: choice
-    options: [patch, minor, major]
     default: patch
   release-version:
     description: 'Optional exact version to release instead of calculating a bump'
@@ -53,13 +51,13 @@ inputs:
 outputs:
   version:
     description: 'The version that was released'
-    value: ${{ steps.set-outputs.outputs.version }}
+    value: ${{ steps.bump.outputs.version }}
   tag:
     description: 'The git tag that was created'
-    value: ${{ steps.set-outputs.outputs.tag }}
+    value: ${{ steps.bump.outputs.tag }}
   release-url:
     description: 'The URL of the created GitHub release'
-    value: ${{ steps.set-outputs.outputs.release-url }}
+    value: ${{ steps.release.outputs.url }}
 
 runs:
   using: 'composite'
@@ -86,7 +84,7 @@ runs:
       id: rollback-save
       shell: bash
       run: |
-        echo "previous-commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+        echo "previous-commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
     - name: Bump version & create tag
       id: bump
@@ -95,7 +93,14 @@ runs:
         INITIAL_VERSION: ${{ inputs.initial-version }}
       run: |
         npm_version_args=()
-        previous_tag=$(git tag --list 'v[0-9]*' --sort=-version:refname | sed -n '1p')
+        previous_tag=''
+
+        while IFS= read -r candidate; do
+          if [[ "$candidate" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            previous_tag="$candidate"
+            break
+          fi
+        done < <(git tag --list 'v*' --sort=-version:refname)
 
         if [[ ! -f package.json ]]; then
           node -e 'const fs = require("fs"); fs.writeFileSync("package.json", JSON.stringify({ name: "release-package", version: process.env.INITIAL_VERSION, private: true }, null, 2) + "\n")'
@@ -130,9 +135,8 @@ runs:
 
         npm version "$requested_version" -m "chore: release %s" "${npm_version_args[@]}"
         tag=$(git describe --tags --abbrev=0)
-        echo "previous-tag=$previous_tag" >> $GITHUB_OUTPUT
-        echo "tag=$tag" >> $GITHUB_OUTPUT
-        echo "version=${tag#v}" >> $GITHUB_OUTPUT
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
     - name: Run release command
       if: ${{ inputs.release-command != '' }}
@@ -145,7 +149,7 @@ runs:
     - name: Generate CHANGELOG.md
       if: ${{ inputs.generate-changelog == 'true' }}
       shell: bash
-      run: 'npx auto-changelog --hide-credit --hide-empty-releases --ignore-commit-pattern "^chore: release"'
+      run: 'npx --yes auto-changelog@2.6.0 --hide-credit --hide-empty-releases --ignore-commit-pattern "^chore: release"'
 
     - name: Commit CHANGELOG
       if: ${{ inputs.generate-changelog == 'true' }}
@@ -160,33 +164,14 @@ runs:
       shell: bash
       run: |
         git push --atomic origin HEAD "refs/tags/${{ steps.bump.outputs.tag }}"
-        echo "completed=true" >> $GITHUB_OUTPUT
+        echo "completed=true" >> "$GITHUB_OUTPUT"
 
     - name: Publish & package extension
       if: ${{ inputs.publish-vsce == 'true' }}
-      id: publish
       uses: HaaLeo/publish-vscode-extension@v2
       with:
         pat:         ${{ env.VSCE_PAT }}
         registryUrl: https://marketplace.visualstudio.com
-
-    - name: Wait for GitHub tag visibility
-      shell: bash
-      env:
-        RELEASE_TAG: ${{ steps.bump.outputs.tag }}
-        GH_TOKEN: ${{ env.GITHUB_TOKEN }}
-      run: |
-        for attempt in {1..15}; do
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" > /dev/null 2>&1; then
-            echo "Tag $RELEASE_TAG is visible through the GitHub API."
-            exit 0
-          fi
-          echo "Waiting for tag $RELEASE_TAG to become visible ($attempt/15)..."
-          sleep 2
-        done
-
-        echo "::error::Tag $RELEASE_TAG was pushed but is not visible through the GitHub API."
-        exit 1
 
     - name: Write changelog config
       env:
@@ -224,33 +209,22 @@ runs:
         print(out)
         PYEOF
 
-    - name: Generate changelog between releases
-      id: changelog_range
-      if: ${{ steps.bump.outputs.previous-tag != '' }}
-      uses: mikepenz/release-changelog-builder-action@v5
-      with:
-        token:         ${{ env.GITHUB_TOKEN }}
-        fromTag:       ${{ steps.bump.outputs.previous-tag }}
-        toTag:         ${{ steps.bump.outputs.tag }}
-        configuration: .changelog-config.json
-        mode:          "COMMIT"
-
-    - name: Generate first-release changelog
-      id: changelog_first
-      if: ${{ steps.bump.outputs.previous-tag == '' }}
+    - name: Generate changelog
+      id: changelog
       uses: mikepenz/release-changelog-builder-action@v5
       with:
         token:         ${{ env.GITHUB_TOKEN }}
         toTag:         ${{ steps.bump.outputs.tag }}
         configuration: .changelog-config.json
         mode:          "COMMIT"
+        failOnError:   true
 
     - name: Shorten commit hashes
       id: notes
       shell: bash
       run: |
         NOTES=$(cat << 'NOTES_EOF'
-        ${{ steps.changelog_range.outputs.changelog || steps.changelog_first.outputs.changelog }}
+        ${{ steps.changelog.outputs.changelog }}
         NOTES_EOF
         )
         NOTES=$(echo "$NOTES" | sed -E 's/([a-f0-9]{7})[a-f0-9]{33}/\1/g')
@@ -259,7 +233,7 @@ runs:
           echo "changelog<<EOF"
           echo "$NOTES"
           echo "EOF"
-        } >> $GITHUB_OUTPUT
+        } >> "$GITHUB_OUTPUT"
 
     - name: Create GitHub release
       id: release
@@ -270,14 +244,6 @@ runs:
         files: |
           ${{ inputs.publish-vsce == 'true' && '*.vsix' || '' }}
           ${{ inputs.files-pattern }}
-
-    - name: Set outputs
-      id: set-outputs
-      shell: bash
-      run: |
-        echo "version=${{ steps.bump.outputs.version }}" >> $GITHUB_OUTPUT
-        echo "tag=${{ steps.bump.outputs.tag }}" >> $GITHUB_OUTPUT
-        echo "release-url=https://github.com/${{ github.repository }}/releases/tag/${{ steps.bump.outputs.tag }}" >> $GITHUB_OUTPUT
 
     - name: Rollback on failure
       if: failure()
