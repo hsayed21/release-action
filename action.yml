@@ -68,6 +68,8 @@ runs:
       uses: actions/checkout@v6
       with:
         fetch-depth: 0
+        fetch-tags: true
+        clean: false
 
     - name: Setup Node.js
       uses: actions/setup-node@v6
@@ -93,6 +95,7 @@ runs:
         INITIAL_VERSION: ${{ inputs.initial-version }}
       run: |
         npm_version_args=()
+        previous_tag=$(git tag --list 'v[0-9]*' --sort=-version:refname | sed -n '1p')
 
         if [[ ! -f package.json ]]; then
           node -e 'const fs = require("fs"); fs.writeFileSync("package.json", JSON.stringify({ name: "release-package", version: process.env.INITIAL_VERSION, private: true }, null, 2) + "\n")'
@@ -103,12 +106,31 @@ runs:
         fi
 
         requested_version="${{ inputs.release-version }}"
-        if [[ -z "$requested_version" ]]; then
+        if [[ -z "$requested_version" && -n "$previous_tag" ]]; then
+          base_version="${previous_tag#v}"
+          if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Latest tag $previous_tag is not a supported stable semantic version."
+            exit 1
+          fi
+
+          IFS='.' read -r major minor patch <<< "$base_version"
+          case "${{ inputs.version }}" in
+            patch) patch=$((patch + 1)) ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            *)
+              echo "::error::Unsupported version bump: ${{ inputs.version }}"
+              exit 1
+              ;;
+          esac
+          requested_version="$major.$minor.$patch"
+        elif [[ -z "$requested_version" ]]; then
           requested_version="${{ inputs.version }}"
         fi
 
         npm version "$requested_version" -m "chore: release %s" "${npm_version_args[@]}"
         tag=$(git describe --tags --abbrev=0)
+        echo "previous-tag=$previous_tag" >> $GITHUB_OUTPUT
         echo "tag=$tag" >> $GITHUB_OUTPUT
         echo "version=${tag#v}" >> $GITHUB_OUTPUT
 
@@ -119,10 +141,6 @@ runs:
         RELEASE_VERSION: ${{ steps.bump.outputs.version }}
         RELEASE_TAG: ${{ steps.bump.outputs.tag }}
       run: ${{ inputs.release-command }}
-
-    - name: Push commit & tag
-      shell: bash
-      run: git push origin HEAD --follow-tags
 
     - name: Generate CHANGELOG.md
       if: ${{ inputs.generate-changelog == 'true' }}
@@ -135,7 +153,14 @@ runs:
       run: |
         git add CHANGELOG.md
         git commit --amend --no-edit
-        git push origin HEAD --force-with-lease
+        git tag --force --annotate "${{ steps.bump.outputs.tag }}" --message "Release ${{ steps.bump.outputs.tag }}"
+
+    - name: Push commit & tag
+      id: push
+      shell: bash
+      run: |
+        git push --atomic origin HEAD "refs/tags/${{ steps.bump.outputs.tag }}"
+        echo "completed=true" >> $GITHUB_OUTPUT
 
     - name: Publish & package extension
       if: ${{ inputs.publish-vsce == 'true' }}
@@ -144,6 +169,24 @@ runs:
       with:
         pat:         ${{ env.VSCE_PAT }}
         registryUrl: https://marketplace.visualstudio.com
+
+    - name: Wait for GitHub tag visibility
+      shell: bash
+      env:
+        RELEASE_TAG: ${{ steps.bump.outputs.tag }}
+        GH_TOKEN: ${{ env.GITHUB_TOKEN }}
+      run: |
+        for attempt in {1..15}; do
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "Tag $RELEASE_TAG is visible through the GitHub API."
+            exit 0
+          fi
+          echo "Waiting for tag $RELEASE_TAG to become visible ($attempt/15)..."
+          sleep 2
+        done
+
+        echo "::error::Tag $RELEASE_TAG was pushed but is not visible through the GitHub API."
+        exit 1
 
     - name: Write changelog config
       env:
@@ -181,8 +224,20 @@ runs:
         print(out)
         PYEOF
 
-    - name: Generate changelog
-      id: changelog
+    - name: Generate changelog between releases
+      id: changelog_range
+      if: ${{ steps.bump.outputs.previous-tag != '' }}
+      uses: mikepenz/release-changelog-builder-action@v5
+      with:
+        token:         ${{ env.GITHUB_TOKEN }}
+        fromTag:       ${{ steps.bump.outputs.previous-tag }}
+        toTag:         ${{ steps.bump.outputs.tag }}
+        configuration: .changelog-config.json
+        mode:          "COMMIT"
+
+    - name: Generate first-release changelog
+      id: changelog_first
+      if: ${{ steps.bump.outputs.previous-tag == '' }}
       uses: mikepenz/release-changelog-builder-action@v5
       with:
         token:         ${{ env.GITHUB_TOKEN }}
@@ -195,10 +250,11 @@ runs:
       shell: bash
       run: |
         NOTES=$(cat << 'NOTES_EOF'
-        ${{ steps.changelog.outputs.changelog }}
+        ${{ steps.changelog_range.outputs.changelog || steps.changelog_first.outputs.changelog }}
         NOTES_EOF
         )
         NOTES=$(echo "$NOTES" | sed -E 's/([a-f0-9]{7})[a-f0-9]{33}/\1/g')
+
         {
           echo "changelog<<EOF"
           echo "$NOTES"
@@ -231,11 +287,23 @@ runs:
         
         TAG="${{ steps.bump.outputs.tag }}"
         PREV="${{ steps.rollback-save.outputs.previous-commit }}"
-        
-        git push --delete origin "$TAG" 2>/dev/null || echo "Remote tag not found"
-        git tag -d "$TAG" 2>/dev/null || echo "Local tag not found"
-        git reset --hard "$PREV"
-        git push origin HEAD --force
+
+        if [[ "${{ steps.push.outputs.completed }}" == "true" ]]; then
+          git push --delete origin "$TAG" 2>/dev/null || echo "Remote tag not found"
+        else
+          echo "Remote tag was not pushed by this run; leaving remote tags unchanged."
+        fi
+
+        if [[ -n "$TAG" ]]; then
+          git tag -d "$TAG" 2>/dev/null || echo "Local tag not found"
+        fi
+
+        if [[ -n "$PREV" ]]; then
+          git reset --hard "$PREV"
+          if [[ "${{ steps.push.outputs.completed }}" == "true" ]]; then
+            git push origin HEAD --force-with-lease
+          fi
+        fi
         
         echo "::error::Rollback complete — tag and commit have been rolled back."
 
